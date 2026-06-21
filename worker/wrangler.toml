@@ -1,0 +1,39 @@
+name = "parchi-api"
+main = "src/index.ts"
+compatibility_date = "2025-06-01"
+
+# --- D1 database ---
+# `parchi setup` runs `wrangler d1 create parchi` and fills in database_id below.
+# (database_id is an opaque id, not a secret — fine to commit to your own repo.)
+[[d1_databases]]
+binding = "DB"
+database_name = "parchi"
+database_id = ""
+
+# --- public-ish vars ---
+[vars]
+# Your renderer (GitHub Pages) URL. `parchi setup` fills this in from your repo,
+# e.g. "https://<you>.github.io/<repo>/". Used only to build the renderer_url in
+# the discovery doc; safe to commit.
+RENDERER_BASE = ""
+
+# NOTE: AGENT_KEY is intentionally NOT declared here. Defining it as a plain var
+# (even "") OVERWRITES the `wrangler secret put AGENT_KEY` secret on every deploy,
+# disabling the trusted-agent bypass. Set it ONLY as a secret. When unset, the
+# agent bypass is disabled; browser writes then depend on TURNSTILE_SECRET
+# (set = require Turnstile; unset = open browser writes, rate-limited per IP).
+#
+# Optional: lock browser writes to a single origin, e.g. your Pages origin
+# "https://<you>.github.io". When unset, the requesting Origin is reflected
+# (writes are still gated by Turnstile / X-Agent-Key).
+# ALLOWED_ORIGIN = "https://<you>.github.io"
+
+# --- secrets (DO NOT put values here; set with `wrangler secret put`) ---
+# `parchi setup` sets these for you AFTER deploy.
+# AGENT_KEY        : trusted-agent bypass secret (the CLI sends it as X-Agent-Key).
+#   wrangler secret put AGENT_KEY
+# TURNSTILE_SECRET : Cloudflare Turnstile siteverify secret. OPTIONAL anti-spam
+#                    gate for browser (human) comments. Without it, browser
+#                    comments are OPEN (rate-limited per IP); set it to require
+#                    human verification. CLI/agent writes use X-Agent-Key either way.
+#   wrangler secret put TURNSTILE_SECRET

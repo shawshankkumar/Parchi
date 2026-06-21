@@ -1,0 +1,20 @@
+{
+  "name": "parchi-worker",
+  "version": "0.1.0",
+  "private": true,
+  "description": "parchi comments API — Cloudflare Worker + D1",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "bunx wrangler dev",
+    "deploy": "bunx wrangler deploy",
+    "typecheck": "bunx tsc --noEmit",
+    "build:dry": "bunx wrangler deploy --dry-run --outdir dist",
+    "db:migrate": "bunx wrangler d1 migrations apply parchi --remote",
+    "db:migrate:local": "bunx wrangler d1 migrations apply parchi --local"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250620.0",
+    "typescript": "^5.5.0",
+    "wrangler": "^3.114.0"
+  }
+}

@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Parchi</title>
+
+    <!-- Agent discovery: this page is a client-side renderer; comment DATA lives
+         in the Parchi API below. An automated client can read these without
+         running JavaScript. The document's gist id is the `g` query parameter of
+         this page's URL. -->
+    <meta name="parchi:api" content="%VITE_PARCHI_API%" />
+    <script type="application/json" id="parchi-agent">
+    {
+      "tool": "parchi",
+      "summary": "Renderer for a gist-backed doc with anchored comments. Comment data is served by the Parchi API (a different host than this page).",
+      "gist_id_source": "the `g` query parameter of this page URL (e.g. ?g=<gistId>)",
+      "api_base": "%VITE_PARCHI_API%",
+      "how_to_read_comments": "GET {api_base}/api/comments?gist={gistId}&state=all",
+      "discovery_doc": "GET {api_base}/g/{gistId}.json  (returns counts + all comment URLs)",
+      "endpoints": {
+        "list":    "GET {api_base}/api/comments?gist={gistId}&state=open|resolved|deleted|all",
+        "get":     "GET {api_base}/api/comments/{commentId}",
+        "create":  "POST {api_base}/api/comments  body: {gist_id,author,body,anchor,gist_revision} (browser needs Turnstile; agents send header X-Agent-Key)",
+        "resolve": "POST {api_base}/api/comments/{commentId}/resolve  body: {resolved_by}",
+        "reopen":  "POST {api_base}/api/comments/{commentId}/reopen"
+      },
+      "comment_fields": "id, gist_id, author, body, anchor, gist_revision, status(open|resolved|deleted), created_at, edited_at, resolved_at, resolved_by",
+      "notes": "Send a normal User-Agent header on requests; the API is behind Cloudflare, which may return 403 for default/empty bot user-agents. Document content itself is NOT here — fetch it client-side from the gist (https://api.github.com/gists/{gistId})."
+    }
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

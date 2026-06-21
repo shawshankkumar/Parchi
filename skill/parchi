@@ -1,0 +1,837 @@
+#!/usr/bin/env node
+/**
+ * parchi — portable CLI for the parchi handoff-doc workflow.
+ *
+ * parchi publishes a plan/handoff doc as a secret GitHub gist (one content file:
+ * plan.md or plan.html) and renders it with inline, anchored comments. It is a
+ * SELF-HOSTED template: there is no shared backend. Every user deploys their own
+ * Cloudflare Worker + D1 and their own GitHub Pages renderer, then points this CLI
+ * at them via `parchi setup` (or `parchi config set-*`).
+ *
+ * Spec: ../CONTRACT.md (single source of truth).
+ *
+ * Config (per value: env var > ~/.config/parchi/config.json; NO built-in default):
+ *   PARCHI_RENDERER   your Pages URL,   e.g. https://<you>.github.io/<repo>/
+ *   PARCHI_API        your Worker URL,  e.g. https://parchi-api.<acct>.workers.dev
+ *   PARCHI_AGENT_KEY  your trusted-agent secret; sent as X-Agent-Key when set
+ *
+ * First run: `parchi setup` provisions everything. `parchi doctor` reports status.
+ * Requires `gh` (authed) for publish/setup; `wrangler` + Cloudflare creds for setup.
+ */
+
+'use strict';
+
+const { execFileSync, spawnSync } = require('node:child_process');
+const crypto = require('node:crypto');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+
+// No baked-in instance. parchi is self-hosted; api/renderer come from config/env.
+const NOT_SETUP =
+  "parchi isn't set up yet. Run `parchi setup` (or ask Claude Code to set it " +
+  'up — see SETUP.md). To point at an existing deployment manually:\n' +
+  '  parchi config set-api <your-worker-url>\n' +
+  '  parchi config set-renderer <your-renderer-url>\n' +
+  '  parchi config set-key <your-agent-key>';
+
+// ---------- config file (~/.config/parchi/config.json) ----------
+// Stores the trusted-agent key and the api/renderer URLs so they persist across
+// shells. Precedence for every value: env var > config file. There is no default.
+
+function configPath() {
+  const base =
+    process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config');
+  return path.join(base, 'parchi', 'config.json');
+}
+
+function loadConfig() {
+  try {
+    const obj = JSON.parse(fs.readFileSync(configPath(), 'utf8'));
+    return obj && typeof obj === 'object' ? obj : {};
+  } catch (_e) {
+    return {};
+  }
+}
+
+function saveConfig(cfg) {
+  const p = configPath();
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, `${JSON.stringify(cfg, null, 2)}\n`, { mode: 0o600 });
+  try {
+    fs.chmodSync(p, 0o600); // key is a secret — keep it user-only
+  } catch (_e) {
+    /* best effort */
+  }
+  return p;
+}
+
+const CONFIG = loadConfig();
+
+const PARCHI_RENDERER = process.env.PARCHI_RENDERER || CONFIG.renderer || '';
+const PARCHI_API = stripTrailingSlash(process.env.PARCHI_API || CONFIG.api);
+const PARCHI_AGENT_KEY =
+  process.env.PARCHI_AGENT_KEY || CONFIG.agent_key || '';
+
+// ---------- small helpers ----------
+
+function die(msg, code = 1) {
+  process.stderr.write(`parchi: ${msg}\n`);
+  process.exit(code);
+}
+
+/** Drop trailing slashes from a URL so we never build `…//…` paths. */
+function stripTrailingSlash(url) {
+  return (url || '').replace(/\/+$/, '');
+}
+
+/** Extract a `database_id = "…"` value from wrangler.toml or `d1 create` output
+ *  (empty `""` placeholders don't match, so an unset id reads as "absent"). */
+function matchDatabaseId(text) {
+  return (String(text).match(/database_id\s*=\s*"([0-9a-fA-F-]+)"/) || [])[1] || '';
+}
+
+function requireApi() {
+  if (!PARCHI_API) die(NOT_SETUP);
+  return PARCHI_API;
+}
+
+function requireRenderer() {
+  if (!PARCHI_RENDERER) die(NOT_SETUP);
+  return PARCHI_RENDERER;
+}
+
+function rendererUrl(gistId) {
+  const base = requireRenderer();
+  const sep = base.includes('?') ? '&' : '?';
+  return `${base}${sep}g=${encodeURIComponent(gistId)}`;
+}
+
+/** Parse a flat set of flags/positionals. Returns { positionals, flags }. */
+function parseArgs(argv, opts = {}) {
+  const boolFlags = new Set(opts.bool || []);
+  const positionals = [];
+  const flags = {};
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--') {
+      positionals.push(...argv.slice(i + 1));
+      break;
+    }
+    if (a.startsWith('--')) {
+      const eq = a.indexOf('=');
+      let key;
+      let val;
+      if (eq !== -1) {
+        key = a.slice(2, eq);
+        val = a.slice(eq + 1);
+      } else {
+        key = a.slice(2);
+        if (boolFlags.has(key)) {
+          val = true;
+        } else {
+          val = argv[i + 1];
+          i++;
+        }
+      }
+      flags[key] = val;
+    } else {
+      positionals.push(a);
+    }
+  }
+  return { positionals, flags };
+}
+
+// ---------- shell helpers ----------
+
+/** True if `cmd` is runnable. */
+function have(cmd) {
+  try {
+    execFileSync(cmd, ['--version'], { stdio: 'ignore' });
+    return true;
+  } catch (_e) {
+    return false;
+  }
+}
+
+/** Run a command, capturing output. Returns { status, stdout, stderr }. */
+function run(cmd, args, opts = {}) {
+  const r = spawnSync(cmd, args, { encoding: 'utf8', ...opts });
+  return {
+    status: r.status,
+    stdout: (r.stdout || '').toString(),
+    stderr: (r.stderr || '').toString(),
+  };
+}
+
+function runOrDie(cmd, args, opts = {}) {
+  const r = run(cmd, args, opts);
+  if (r.status !== 0) {
+    die(`${cmd} ${args.join(' ')} failed:\n${(r.stderr || r.stdout).trim()}`);
+  }
+  return r;
+}
+
+function step(msg) {
+  process.stdout.write(`\n▸ ${msg}\n`);
+}
+
+function info(msg) {
+  process.stdout.write(`  ${msg}\n`);
+}
+
+// ---------- gh wrapper ----------
+
+function ensureGh() {
+  if (!have('gh')) {
+    die(
+      'GitHub CLI `gh` not found. Install it (https://cli.github.com/) and run `gh auth login`.'
+    );
+  }
+  const auth = spawnSync('gh', ['auth', 'status'], { stdio: 'ignore' });
+  if (auth.status !== 0) {
+    die('`gh` is not authenticated. Run `gh auth login` first.');
+  }
+}
+
+/** Resolve the file to a temp copy named plan.md / plan.html and return its path. */
+function stagePlanFile(srcPath, format) {
+  if (!fs.existsSync(srcPath)) {
+    die(`file not found: ${srcPath}`);
+  }
+  const name = format === 'html' ? 'plan.html' : 'plan.md';
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'parchi-'));
+  const dest = path.join(dir, name);
+  fs.copyFileSync(srcPath, dest);
+  return dest;
+}
+
+function resolveFormat(srcPath, flags) {
+  if (flags.md && flags.html) die('pass only one of --md / --html.');
+  if (flags.md) return 'md';
+  if (flags.html) return 'html';
+  const ext = path.extname(srcPath).toLowerCase();
+  if (ext === '.md' || ext === '.markdown') return 'md';
+  if (ext === '.html' || ext === '.htm') return 'html';
+  die(
+    `cannot infer format from "${path.basename(srcPath)}". ` +
+      'Pass --md or --html.'
+  );
+  return 'md'; // unreachable
+}
+
+/** Parse the gist id out of the URL `gh gist create` prints on stdout. */
+function gistIdFromUrl(url) {
+  const m = String(url).trim().match(/([0-9a-f]+)\s*$/i);
+  return m ? m[1] : String(url).trim();
+}
+
+// ---------- HTTP (uses global fetch, Node >= 18) ----------
+
+async function apiFetch(urlPath, { method = 'GET', body } = {}) {
+  if (typeof fetch !== 'function') {
+    die('global fetch unavailable; Node 18+ is required for API commands.');
+  }
+  const api = requireApi();
+  const url = urlPath.startsWith('http') ? urlPath : `${api}${urlPath}`;
+  const headers = { Accept: 'application/json' };
+  if (body !== undefined) headers['Content-Type'] = 'application/json';
+  if (PARCHI_AGENT_KEY) headers['X-Agent-Key'] = PARCHI_AGENT_KEY;
+
+  let res;
+  try {
+    res = await fetch(url, {
+      method,
+      headers,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+  } catch (e) {
+    die(`request failed (${url}): ${e.message}`);
+  }
+  const text = await res.text();
+  if (!res.ok) {
+    die(`API ${method} ${url} -> ${res.status}\n${text}`);
+  }
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch (_e) {
+    return text;
+  }
+}
+
+function printJson(obj) {
+  process.stdout.write(`${JSON.stringify(obj, null, 2)}\n`);
+}
+
+// ---------- commands ----------
+
+const USAGE = `parchi — publish a plan as a secret gist and manage comments (self-hosted).
+
+Usage:
+  parchi setup [--repo <name>] [--public|--private]
+  parchi doctor
+  parchi publish <file> [--md|--html] [--update <gistId>] [--json]
+  parchi comments <gistId> [--state open|resolved|deleted|all] [--json]
+  parchi resolve <commentId> [--by <name>]
+  parchi reopen  <commentId>
+  parchi discover <gistId>
+  parchi config <show|set-key|set-api|set-renderer> [value]
+  parchi --help
+
+Commands:
+  setup      First-run provision: deploy your Worker+D1 to Cloudflare, create the
+             GitHub repo + Pages, wire env vars, and write local config. Run from
+             inside a cloned parchi repo.
+  doctor     Check prerequisites and configuration (gh, wrangler, Cloudflare
+             creds, local config, Worker reachability).
+  publish    Copy <file> to plan.md / plan.html and create (or --update) a
+             secret gist via gh. Prints the gist + renderer links.
+  comments   List comments for a gist via YOUR Worker API.
+  resolve    Mark a comment resolved (POST .../resolve).
+  reopen     Reopen a resolved comment (POST .../reopen).
+  discover   Fetch the discovery doc (GET /g/<id>.json).
+  config     View/set the agent key and api/renderer URLs (persisted in
+             ~/.config/parchi/config.json).
+
+Config & precedence (per value: env var > config file; NO built-in default):
+  agent_key   trusted-agent secret; required to POST comments as an agent.
+  api         your Worker base URL
+  renderer    your Pages URL
+Env overrides: PARCHI_AGENT_KEY, PARCHI_API, PARCHI_RENDERER.
+
+Requires \`gh\` (authenticated) for publish/setup.`;
+
+const PUBLISH_USAGE = `parchi publish <file> [--md|--html] [--update <gistId>] [--json]
+
+Copies <file> to plan.md or plan.html (format from --md/--html or the file's
+extension), then creates a secret gist (\`gh gist create\`, secret by default) or, with
+--update <gistId>, edits the existing gist (\`gh gist edit <id>\`).
+
+Flags:
+  --md            Force markdown (publish as plan.md).
+  --html          Force HTML (publish as plan.html).
+  --update <id>   Update an existing gist instead of creating a new one.
+  --json          Print only machine JSON: { gist_id, gist_url, renderer_url }.
+
+Requires \`parchi setup\` (or a configured renderer/api) so the renderer link works.`;
+
+async function cmdPublish(argv) {
+  const { positionals, flags } = parseArgs(argv, { bool: ['md', 'html', 'json'] });
+  if (flags.help || positionals.length === 0) {
+    process.stdout.write(`${PUBLISH_USAGE}\n`);
+    return;
+  }
+  requireRenderer(); // fail early with a helpful message if not set up
+  const srcPath = path.resolve(positionals[0]);
+  const format = resolveFormat(srcPath, flags);
+  const updateId = typeof flags.update === 'string' ? flags.update : undefined;
+  if (flags.update === true) die('--update requires a <gistId>.');
+
+  ensureGh();
+  const staged = stagePlanFile(srcPath, format);
+  const fileName = path.basename(staged); // plan.md | plan.html
+
+  let gistId;
+  let gistUrl;
+
+  if (updateId) {
+    // gh gist edit <id> -f <name> <staged> : overwrite file `name` with content.
+    const r = spawnSync('gh', ['gist', 'edit', updateId, '-f', fileName, staged], {
+      encoding: 'utf8',
+    });
+    if (r.status !== 0) {
+      die(`gh gist edit failed:\n${(r.stderr || r.stdout || '').trim()}`);
+    }
+    gistId = updateId;
+    gistUrl = `https://gist.github.com/${gistId}`;
+  } else {
+    // gh gists are secret by default; there is no --secret flag (only -p/--public).
+    const r = spawnSync('gh', ['gist', 'create', staged], { encoding: 'utf8' });
+    if (r.status !== 0) {
+      die(`gh gist create failed:\n${(r.stderr || r.stdout || '').trim()}`);
+    }
+    gistUrl = (r.stdout || '').trim().split(/\r?\n/).filter(Boolean).pop() || '';
+    gistId = gistIdFromUrl(gistUrl);
+    if (!gistUrl) gistUrl = `https://gist.github.com/${gistId}`;
+  }
+
+  const out = {
+    gist_id: gistId,
+    gist_url: gistUrl,
+    renderer_url: rendererUrl(gistId),
+  };
+
+  if (flags.json) {
+    printJson(out);
+    return;
+  }
+
+  const action = updateId ? 'Updated' : 'Published';
+  process.stdout.write(
+    `\n${action} ${fileName} as a secret gist.\n\n` +
+      `  Gist:     ${out.gist_url}\n` +
+      `  Renderer: ${out.renderer_url}\n\n` +
+      `Reviewers can read & comment in the renderer (inline, anchored).\n` +
+      `Comments are also reachable via the API:\n` +
+      `  parchi comments ${gistId}\n` +
+      `  parchi discover ${gistId}\n\n` +
+      `To update this doc later:\n` +
+      `  parchi publish <file> --update ${gistId}\n\n`
+  );
+  process.stdout.write(`${JSON.stringify(out)}\n`);
+}
+
+async function cmdComments(argv) {
+  const { positionals, flags } = parseArgs(argv, { bool: ['json'] });
+  if (flags.help || positionals.length === 0) {
+    process.stdout.write(
+      'parchi comments <gistId> [--state open|resolved|deleted|all] [--json]\n'
+    );
+    return;
+  }
+  const gistId = positionals[0];
+  const state = flags.state || 'open';
+  const data = await apiFetch(
+    `/api/comments?gist=${encodeURIComponent(gistId)}&state=${encodeURIComponent(state)}`
+  );
+  printJson(data);
+}
+
+async function cmdResolve(argv) {
+  const { positionals, flags } = parseArgs(argv);
+  if (flags.help || positionals.length === 0) {
+    process.stdout.write('parchi resolve <commentId> [--by <name>]\n');
+    return;
+  }
+  const cid = positionals[0];
+  const resolvedBy = (typeof flags.by === 'string' && flags.by) || 'parchi-cli';
+  const data = await apiFetch(`/api/comments/${encodeURIComponent(cid)}/resolve`, {
+    method: 'POST',
+    body: { resolved_by: resolvedBy },
+  });
+  printJson(data);
+}
+
+async function cmdReopen(argv) {
+  const { positionals, flags } = parseArgs(argv);
+  if (flags.help || positionals.length === 0) {
+    process.stdout.write('parchi reopen <commentId>\n');
+    return;
+  }
+  const cid = positionals[0];
+  const data = await apiFetch(`/api/comments/${encodeURIComponent(cid)}/reopen`, {
+    method: 'POST',
+    body: {},
+  });
+  printJson(data);
+}
+
+async function cmdDiscover(argv) {
+  const { positionals, flags } = parseArgs(argv);
+  if (flags.help || positionals.length === 0) {
+    process.stdout.write('parchi discover <gistId>\n');
+    return;
+  }
+  const gistId = positionals[0];
+  const data = await apiFetch(`/g/${encodeURIComponent(gistId)}.json`);
+  printJson(data);
+}
+
+function maskKey(k) {
+  if (!k) return '(not set)';
+  return k.length <= 6 ? '****' : `${k.slice(0, 3)}…${k.slice(-2)}`;
+}
+
+function cmdConfig(argv) {
+  const { positionals } = parseArgs(argv);
+  const sub = positionals[0];
+  const value = positionals[1];
+  const cfg = CONFIG; // already loaded at startup; this is a one-shot command
+
+  switch (sub) {
+    case 'path':
+      process.stdout.write(`${configPath()}\n`);
+      return;
+    case 'show': {
+      const src = (env, conf) => (env ? 'env' : conf ? 'config' : 'unset');
+      process.stdout.write(
+        `config file : ${configPath()}\n` +
+          `api         : ${PARCHI_API || '(unset)'}  (${src(process.env.PARCHI_API, CONFIG.api)})\n` +
+          `renderer    : ${PARCHI_RENDERER || '(unset)'}  (${src(process.env.PARCHI_RENDERER, CONFIG.renderer)})\n` +
+          `agent_key   : ${maskKey(PARCHI_AGENT_KEY)}  (${process.env.PARCHI_AGENT_KEY ? 'env' : CONFIG.agent_key ? 'config' : 'unset'})\n`
+      );
+      if (!PARCHI_API || !PARCHI_RENDERER) {
+        process.stdout.write(`\n${NOT_SETUP}\n`);
+      }
+      return;
+    }
+    case 'set-key':
+      if (!value) die('usage: parchi config set-key <KEY>');
+      cfg.agent_key = value;
+      process.stdout.write(`Saved agent_key to ${saveConfig(cfg)} (chmod 600).\n`);
+      return;
+    case 'set-api':
+      if (!value) die('usage: parchi config set-api <URL>');
+      cfg.api = stripTrailingSlash(value);
+      process.stdout.write(`Saved api=${cfg.api} to ${saveConfig(cfg)}.\n`);
+      return;
+    case 'set-renderer':
+      if (!value) die('usage: parchi config set-renderer <URL>');
+      cfg.renderer = value;
+      process.stdout.write(`Saved renderer=${cfg.renderer} to ${saveConfig(cfg)}.\n`);
+      return;
+    default:
+      process.stdout.write(
+        'parchi config <show|path|set-key|set-api|set-renderer> [value]\n\n' +
+          '  show           Print effective api/renderer/agent_key and their source.\n' +
+          '  set-key <KEY>  Store the trusted-agent key (needed to POST comments as an agent).\n' +
+          '  set-api <URL>  Your Worker deployment base URL.\n' +
+          '  set-renderer <URL>  Your renderer (GitHub Pages) URL.\n'
+      );
+  }
+}
+
+// ---------- setup / doctor (self-hosting orchestration) ----------
+
+/** Locate the cloned parchi repo root (must contain worker/ and renderer/). */
+function findRepoRoot() {
+  const r = run('git', ['rev-parse', '--show-toplevel']);
+  const root = r.status === 0 ? r.stdout.trim() : process.cwd();
+  if (
+    !fs.existsSync(path.join(root, 'worker', 'wrangler.toml')) ||
+    !fs.existsSync(path.join(root, 'renderer', 'vite.config.ts'))
+  ) {
+    die(
+      'run `parchi setup` from inside a cloned parchi repo (the one with ' +
+        'worker/ and renderer/). Current dir: ' +
+        process.cwd()
+    );
+  }
+  return root;
+}
+
+/** Pick a package runner. Bun-first per the repo toolchain. */
+function pkgRunners() {
+  if (have('bun')) return { install: ['bun', ['install']], x: ['bunx'] };
+  if (have('npm')) return { install: ['npm', ['install']], x: ['npx'] };
+  die('neither `bun` nor `npm` found. Install Bun (https://bun.sh) to continue.');
+  return null; // unreachable
+}
+
+function replaceInFile(file, pattern, replacement, label) {
+  const before = fs.readFileSync(file, 'utf8');
+  const after = before.replace(pattern, replacement);
+  if (after === before) {
+    info(`(${label}: no change needed)`);
+    return false;
+  }
+  fs.writeFileSync(file, after);
+  info(`${label}: updated`);
+  return true;
+}
+
+function cmdDoctor() {
+  step('parchi doctor');
+  const rows = [];
+  const check = (name, ok, detail) =>
+    rows.push(`  ${ok ? '✓' : '✗'}  ${name.padEnd(22)} ${detail}`);
+
+  const ghOk = spawnSync('gh', ['auth', 'status'], { stdio: 'ignore' }).status === 0;
+  check('gh (authenticated)', ghOk, ghOk ? '' : 'install + `gh auth login`');
+
+  const bun = have('bun');
+  check('bun', bun, bun ? '' : 'recommended: https://bun.sh');
+
+  const wrOk = bun || have('npm') || have('wrangler');
+  check('wrangler runner', wrOk, wrOk ? 'via bunx/npx' : 'need bun or npm');
+
+  // Cloudflare auth: a `wrangler login` session OR an API token both work.
+  let cfOk = !!process.env.CLOUDFLARE_API_TOKEN;
+  let cfHow = cfOk ? 'CLOUDFLARE_API_TOKEN set' : '';
+  if (!cfOk) {
+    const cfRoot = (run('git', ['rev-parse', '--show-toplevel']).stdout || '').trim();
+    const workerDir =
+      cfRoot && fs.existsSync(path.join(cfRoot, 'worker', 'node_modules'))
+        ? path.join(cfRoot, 'worker')
+        : null;
+    const x = have('bun') ? 'bunx' : have('npx') ? 'npx' : null;
+    if (workerDir && x) {
+      const who = run(x, ['wrangler', 'whoami'], { cwd: workerDir, timeout: 25000 });
+      if (who.status === 0) {
+        cfOk = true;
+        cfHow = '`wrangler login` session';
+      }
+    }
+  }
+  // `•` (not `✗`): it's an either/or, not a hard failure.
+  rows.push(
+    `  ${cfOk ? '✓' : '•'}  ${'Cloudflare auth'.padEnd(22)} ${
+      cfOk ? cfHow : 'run `bunx wrangler login` (simplest), or export CLOUDFLARE_API_TOKEN'
+    }`,
+  );
+
+  check('config: api', !!PARCHI_API, PARCHI_API || 'run `parchi setup`');
+  check('config: renderer', !!PARCHI_RENDERER, PARCHI_RENDERER || 'run `parchi setup`');
+  check('config: agent_key', !!PARCHI_AGENT_KEY, PARCHI_AGENT_KEY ? maskKey(PARCHI_AGENT_KEY) : 'auto-generated by `parchi setup` — no manual action');
+
+  process.stdout.write(`${rows.join('\n')}\n`);
+  if (!cfOk) {
+    info(`\nCloudflare: \`bunx wrangler login\` is the simplest. For unattended /`);
+    info(`Claude-driven setup, export CLOUDFLARE_API_TOKEN instead. Set`);
+    info(`CLOUDFLARE_ACCOUNT_ID only if your login has multiple Cloudflare accounts.`);
+    info(`The agent key is generated for you — no manual token needed.`);
+  }
+  if (PARCHI_API) {
+    info(`\nTip: verify the Worker with  parchi discover <anyGistId>`);
+  } else {
+    info(`\nNot set up yet. Run \`parchi setup\` (or ask Claude Code — see SETUP.md).`);
+  }
+}
+
+async function cmdSetup(argv) {
+  const { flags } = parseArgs(argv, { bool: ['public', 'private', 'help'] });
+  if (flags.help) {
+    process.stdout.write(
+      'parchi setup [--repo <name>] [--public|--private]\n\n' +
+        'Provisions your own parchi: Cloudflare Worker+D1, GitHub repo + Pages,\n' +
+        'env vars, and local config. Run from inside a cloned parchi repo.\n' +
+        'Reads Cloudflare creds from CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID\n' +
+        '(or an existing `wrangler login`). Requires an authenticated `gh`.\n'
+    );
+    return;
+  }
+
+  const root = findRepoRoot();
+  const workerDir = path.join(root, 'worker');
+  const rendererDir = path.join(root, 'renderer');
+  const tomlPath = path.join(workerDir, 'wrangler.toml');
+  const viteCfg = path.join(rendererDir, 'vite.config.ts');
+  const notFound = path.join(rendererDir, 'public', '404.html');
+
+  step('Checking prerequisites');
+  ensureGh();
+  const runners = pkgRunners();
+  const wrangler = (args, opts = {}) =>
+    run(runners.x[0], ['wrangler', ...args], { cwd: workerDir, ...opts });
+  const wranglerOrDie = (args, opts = {}) => {
+    const r = wrangler(args, opts);
+    if (r.status !== 0) {
+      die(`wrangler ${args.join(' ')} failed:\n${(r.stderr || r.stdout).trim()}`);
+    }
+    return r;
+  };
+
+  // Cloudflare auth: env token, or an interactive `wrangler login` session.
+  const cfWho = wrangler(['whoami']);
+  if (cfWho.status !== 0 && !process.env.CLOUDFLARE_API_TOKEN) {
+    die(
+      'Cloudflare not authenticated. Easiest: run `bunx wrangler login` (interactive),\n' +
+        'then re-run setup. For unattended / Claude-driven setup instead, export:\n' +
+        '  CLOUDFLARE_API_TOKEN   (dashboard → My Profile → API Tokens → "Edit Cloudflare Workers")\n' +
+        '  CLOUDFLARE_ACCOUNT_ID  (only if your login has multiple Cloudflare accounts)\n' +
+        'See .env.example.'
+    );
+  }
+  info('gh authenticated ✓  Cloudflare reachable ✓');
+  info('(An agent key will be generated automatically — no action needed from you.)');
+
+  // --- GitHub repo resolution ---
+  step('Resolving GitHub repository');
+  let slug = '';
+  const view = run('gh', ['repo', 'view', '--json', 'nameWithOwner', '-q', '.nameWithOwner'], { cwd: root });
+  if (view.status === 0 && view.stdout.trim()) {
+    slug = view.stdout.trim();
+  } else {
+    const name = (typeof flags.repo === 'string' && flags.repo) || path.basename(root);
+    const visibility = flags.private ? '--private' : '--public';
+    info(`No GitHub repo yet — creating ${name} (${visibility.slice(2)})`);
+    runOrDie('gh', ['repo', 'create', name, visibility, '--source=.', '--remote=origin', '--push'], { cwd: root });
+    slug = run('gh', ['repo', 'view', '--json', 'nameWithOwner', '-q', '.nameWithOwner'], { cwd: root }).stdout.trim();
+  }
+  const [owner, repo] = slug.split('/');
+  if (!owner || !repo) die(`could not resolve owner/repo (got "${slug}").`);
+  const rendererBase = `https://${owner.toLowerCase()}.github.io/${repo}/`;
+  info(`Repo: ${slug}`);
+  info(`Renderer will be: ${rendererBase}`);
+
+  // --- Patch base paths to match the repo name ---
+  step('Setting renderer base path');
+  replaceInFile(viteCfg, /base:\s*["'][^"']*["']/, `base: "/${repo}/"`, 'vite.config.ts base');
+  replaceInFile(notFound, /var base\s*=\s*["'][^"']*["']/, `var base = "/${repo}/"`, '404.html base');
+
+  // --- Worker deps ---
+  step('Installing worker dependencies');
+  runOrDie(runners.install[0], runners.install[1], { cwd: workerDir, stdio: 'inherit' });
+
+  // --- D1 database ---
+  step('Provisioning D1 database "parchi"');
+  let dbId = '';
+  const existingId = matchDatabaseId(fs.readFileSync(tomlPath, 'utf8'));
+  if (existingId) {
+    dbId = existingId;
+    info(`Already configured: ${dbId}`);
+  } else {
+    const create = wrangler(['d1', 'create', 'parchi']);
+    if (create.status === 0) {
+      dbId = matchDatabaseId(create.stdout);
+    } else if (/already exists/i.test(create.stderr + create.stdout)) {
+      const list = wranglerOrDie(['d1', 'list', '--json']);
+      try {
+        const arr = JSON.parse(list.stdout);
+        dbId = (arr.find((d) => d.name === 'parchi') || {}).uuid || '';
+      } catch (_e) {
+        /* fall through */
+      }
+    } else {
+      die(`wrangler d1 create failed:\n${(create.stderr || create.stdout).trim()}`);
+    }
+    if (!dbId) die('could not determine the D1 database_id. Check `wrangler d1 list`.');
+    replaceInFile(tomlPath, /database_id\s*=\s*"[^"]*"/, `database_id = "${dbId}"`, 'wrangler.toml database_id');
+  }
+
+  // --- RENDERER_BASE var (committed; not a secret) ---
+  step('Wiring RENDERER_BASE');
+  replaceInFile(tomlPath, /RENDERER_BASE\s*=\s*"[^"]*"/, `RENDERER_BASE = "${rendererBase}"`, 'wrangler.toml RENDERER_BASE');
+
+  // --- Migrations ---
+  step('Applying D1 migrations (remote)');
+  wranglerOrDie(['d1', 'migrations', 'apply', 'parchi', '--remote'], { stdio: 'inherit' });
+
+  // --- Deploy ---
+  step('Deploying the Worker');
+  const deploy = wranglerOrDie(['deploy'], { stdio: 'pipe' });
+  const workerUrl = ((deploy.stdout + deploy.stderr).match(/https:\/\/[^\s]+\.workers\.dev/) || [])[0];
+  if (!workerUrl) die('deployed, but could not parse the Worker URL from output.');
+  info(`Worker: ${workerUrl}`);
+
+  // --- Secrets AFTER deploy (avoids clobbering; AGENT_KEY is never a [vars]) ---
+  step('Setting secrets');
+  const reusedKey = !!(process.env.PARCHI_AGENT_KEY || CONFIG.agent_key);
+  const agentKey = process.env.PARCHI_AGENT_KEY || CONFIG.agent_key || crypto.randomBytes(32).toString('hex');
+  wranglerOrDie(['secret', 'put', 'AGENT_KEY'], { input: agentKey });
+  info(
+    reusedKey
+      ? 'AGENT_KEY set from your env/config (trusted-agent bypass enabled)'
+      : 'AGENT_KEY generated and set as a Worker secret (saved to your local config; never printed)'
+  );
+  if (process.env.TURNSTILE_SECRET) {
+    wranglerOrDie(['secret', 'put', 'TURNSTILE_SECRET'], { input: process.env.TURNSTILE_SECRET });
+    info('TURNSTILE_SECRET set (browser comments require human verification)');
+  } else {
+    info('TURNSTILE_SECRET not provided — browser comments are OPEN (rate-limited; anyone with the link can comment). Set it later to gate spam.');
+  }
+
+  // --- GitHub Actions Variables for the Pages build ---
+  step('Setting repo Actions variables');
+  runOrDie('gh', ['variable', 'set', 'VITE_PARCHI_API', '--repo', slug, '--body', workerUrl], { cwd: root });
+  info('VITE_PARCHI_API set');
+  if (process.env.VITE_TURNSTILE_SITEKEY) {
+    runOrDie('gh', ['variable', 'set', 'VITE_TURNSTILE_SITEKEY', '--repo', slug, '--body', process.env.VITE_TURNSTILE_SITEKEY], { cwd: root });
+    info('VITE_TURNSTILE_SITEKEY set');
+  }
+
+  // --- Enable GitHub Pages (Actions source) ---
+  step('Enabling GitHub Pages (Actions source)');
+  const pagesPost = run('gh', ['api', `repos/${slug}/pages`, '-f', 'build_type=workflow'], { cwd: root });
+  if (pagesPost.status !== 0) {
+    // already exists -> update
+    run('gh', ['api', '-X', 'PUT', `repos/${slug}/pages`, '-f', 'build_type=workflow'], { cwd: root });
+  }
+  info('Pages set to deploy from GitHub Actions');
+
+  // --- Commit + push the templated config ---
+  step('Committing & pushing configuration');
+  run('git', ['add', 'worker/wrangler.toml', 'renderer/vite.config.ts', 'renderer/public/404.html'], { cwd: root });
+  const commit = run('git', ['commit', '-m', 'chore: configure parchi deployment'], { cwd: root });
+  if (commit.status !== 0 && !/nothing to commit/i.test(commit.stdout + commit.stderr)) {
+    info(`(commit skipped: ${(commit.stdout || commit.stderr).trim().split('\n')[0]})`);
+  }
+  const push = run('git', ['push'], { cwd: root });
+  if (push.status !== 0) {
+    info(`(push skipped/failed: ${(push.stderr || push.stdout).trim().split('\n').pop()})`);
+  } else {
+    info('Pushed');
+  }
+
+  // The Pages workflow is deploy-on-demand (no push trigger), so trigger it now.
+  step('Triggering the Pages build');
+  const branch = run('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: root }).stdout.trim() || 'main';
+  const wf = run('gh', ['workflow', 'run', 'pages.yml', '--ref', branch, '--repo', slug], { cwd: root });
+  if (wf.status === 0) {
+    info('Pages build triggered (watch the Actions tab)');
+  } else {
+    info('(could not auto-trigger — run it from the Actions tab or: gh workflow run pages.yml)');
+  }
+
+  // --- Write local CLI config ---
+  step('Writing local config');
+  const saved = saveConfig({ api: stripTrailingSlash(workerUrl), renderer: rendererBase, agent_key: agentKey });
+  info(`Wrote ${saved} (chmod 600)`);
+
+  // --- Summary ---
+  process.stdout.write(
+    `\n✅ parchi is set up.\n\n` +
+      `  Worker API : ${workerUrl}\n` +
+      `  Renderer   : ${rendererBase}  (live after the Pages build finishes)\n` +
+      `  Repo       : https://github.com/${slug}\n` +
+      `  Config     : ${saved}\n\n` +
+      `Next:\n` +
+      `  • Wait for the "Deploy renderer to GitHub Pages" Action to go green.\n` +
+      `  • Publish your first doc:  parchi publish plan.md\n`
+  );
+  if (!process.env.TURNSTILE_SECRET) {
+    process.stdout.write(
+      `\nBrowser comments work now (open, rate-limited). Optional — add spam\n` +
+        `protection (Cloudflare Turnstile) later:\n` +
+        `  1. Create a Turnstile widget (Cloudflare dashboard → Turnstile).\n` +
+        `  2. export TURNSTILE_SECRET=… VITE_TURNSTILE_SITEKEY=… and re-run \`parchi setup\`.\n`
+    );
+  }
+}
+
+// ---------- entry ----------
+
+async function main() {
+  const [, , cmd, ...rest] = process.argv;
+
+  if (!cmd || cmd === '--help' || cmd === '-h' || cmd === 'help') {
+    process.stdout.write(`${USAGE}\n`);
+    return;
+  }
+  if (cmd === '--version' || cmd === '-v') {
+    process.stdout.write('parchi 1.0.0\n');
+    return;
+  }
+
+  switch (cmd) {
+    case 'setup':
+      await cmdSetup(rest);
+      break;
+    case 'doctor':
+      cmdDoctor();
+      break;
+    case 'publish':
+      await cmdPublish(rest);
+      break;
+    case 'comments':
+      await cmdComments(rest);
+      break;
+    case 'resolve':
+      await cmdResolve(rest);
+      break;
+    case 'reopen':
+      await cmdReopen(rest);
+      break;
+    case 'discover':
+      await cmdDiscover(rest);
+      break;
+    case 'config':
+      cmdConfig(rest);
+      break;
+    default:
+      die(`unknown command "${cmd}". Run \`parchi --help\`.`);
+  }
+}
+
+main().catch((e) => die(e && e.stack ? e.stack : String(e)));

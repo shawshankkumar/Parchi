@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Parchi</title>
+    <script>
+      // GitHub Pages SPA fallback.
+      // Any deep link / unknown path is redirected to the app root under /parchi/,
+      // preserving the query string (?g=...) and hash so deep links keep working.
+      (function () {
+        var base = "/parchi/";
+        var l = window.location;
+        var target = l.protocol + "//" + l.host + base + l.search + l.hash;
+        l.replace(target);
+      })();
+    </script>
+  </head>
+  <body>
+    Redirecting…
+  </body>
+</html>

@@ -1,0 +1,75 @@
+name: Deploy renderer to GitHub Pages
+
+# Deploy-on-demand only. This does NOT run on push, so the template/source repo
+# never tries to deploy Pages (and never shows a failing check). On YOUR own
+# clone, `parchi setup` enables Pages, sets the build variables, and triggers
+# this workflow (`gh workflow run pages.yml`). You can also run it manually from
+# the Actions tab, or guard it for forks (deploy only when configured).
+on:
+  workflow_dispatch:
+
+# Allow the workflow to publish to Pages.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Only one Pages deploy at a time; let in-progress finish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: renderer
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Require configuration
+        # Refuse to build/deploy unless the Worker URL Variable is set, so an
+        # accidental run on an unconfigured repo fails fast with a clear reason
+        # rather than shipping a broken renderer.
+        working-directory: .
+        run: |
+          if [ -z "${{ vars.VITE_PARCHI_API }}" ]; then
+            echo "::error::VITE_PARCHI_API repo Variable is not set. Run \`parchi setup\` (or set it under Settings → Secrets and variables → Actions → Variables) before deploying." >&2
+            exit 1
+          fi
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build
+        # Build-time vars are injected from repo Actions variables/secrets.
+        # VITE_PARCHI_API   -> repository "Variable" (public Worker URL)
+        # VITE_TURNSTILE_SITEKEY -> repository "Variable" (public Turnstile sitekey)
+        env:
+          VITE_PARCHI_API: ${{ vars.VITE_PARCHI_API }}
+          VITE_TURNSTILE_SITEKEY: ${{ vars.VITE_TURNSTILE_SITEKEY }}
+        run: bun run build
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: renderer/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
