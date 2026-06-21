@@ -1,5 +1,9 @@
 # Parchi
 
+## Demo
+
+[View Demo Video](https://drive.google.com/file/d/1wAZXwCnSy6kotsbMiCtMSbUtoXCE346r/view?usp=sharing)
+
 **Publish a plan/handoff doc as a secret GitHub gist, render it with inline,
 anchored comments — on infrastructure you own.**
 
